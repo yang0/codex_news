@@ -1,0 +1,49 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex WebUI (Stream)</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="app-header">
+        <div>
+          <h1>Codex WebUI</h1>
+          <p class="subtitle">Interactive-like stream (function bridge, no PTY)</p>
+        </div>
+        <div class="status-panel">
+          <span id="statusBadge" data-kind="connecting">Connecting...</span>
+          <span class="thread-pill">Thread: <strong id="threadValue">none</strong></span>
+        </div>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+      <div id="runStatusLine" class="run-status-line" hidden>
+        <span id="runStatusSpinner" class="run-status-spinner" aria-hidden="true">•</span>
+        <span id="runStatusText" class="run-status-text">Working</span>
+        <span id="runStatusMeta" class="run-status-meta">(0s • Stop to interrupt)</span>
+      </div>
+
+      <form id="composer" class="composer">
+        <textarea
+          id="promptInput"
+          rows="4"
+          placeholder="输入提示词，按 Send 发送给 Codex"
+          required
+        ></textarea>
+
+        <div class="toolbar">
+          <button id="sendButton" type="submit">Send</button>
+          <button id="stopButton" type="button">Stop</button>
+          <button id="resetThreadButton" type="button">Reset Thread</button>
+          <button id="reconnectButton" type="button">Reconnect</button>
+          <button id="clearButton" type="button">Clear</button>
+        </div>
+      </form>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
