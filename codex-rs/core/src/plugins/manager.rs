@@ -1,8 +1,9 @@
 use super::load_plugin_manifest;
+use super::marketplace::MarketplaceError;
+use super::marketplace::resolve_marketplace_plugin;
 use super::plugin_manifest_name;
 use super::store::DEFAULT_PLUGIN_VERSION;
 use super::store::PluginId;
-use super::store::PluginInstallRequest;
 use super::store::PluginInstallResult;
 use super::store::PluginStore;
 use super::store::PluginStoreError;
@@ -33,6 +34,17 @@ use tracing::warn;
 
 const DEFAULT_SKILLS_DIR_NAME: &str = "skills";
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
+const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AppConnectorId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInstallRequest {
+    pub plugin_name: String,
+    pub marketplace_name: String,
+    pub cwd: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedPlugin {
@@ -42,6 +54,7 @@ pub struct LoadedPlugin {
     pub enabled: bool,
     pub skill_roots: Vec<PathBuf>,
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    pub apps: Vec<AppConnectorId>,
     pub error: Option<String>,
 }
 
@@ -51,12 +64,66 @@ impl LoadedPlugin {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginCapabilitySummary {
+    pub config_name: String,
+    pub display_name: String,
+    pub has_skills: bool,
+    pub mcp_server_names: Vec<String>,
+    pub app_connector_ids: Vec<AppConnectorId>,
+}
+
+impl PluginCapabilitySummary {
+    fn from_plugin(plugin: &LoadedPlugin) -> Option<Self> {
+        if !plugin.is_active() {
+            return None;
+        }
+
+        let mut mcp_server_names: Vec<String> = plugin.mcp_servers.keys().cloned().collect();
+        mcp_server_names.sort_unstable();
+
+        let summary = Self {
+            config_name: plugin.config_name.clone(),
+            display_name: plugin
+                .manifest_name
+                .clone()
+                .unwrap_or_else(|| plugin.config_name.clone()),
+            has_skills: !plugin.skill_roots.is_empty(),
+            mcp_server_names,
+            app_connector_ids: plugin.apps.clone(),
+        };
+
+        (summary.has_skills
+            || !summary.mcp_server_names.is_empty()
+            || !summary.app_connector_ids.is_empty())
+        .then_some(summary)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PluginLoadOutcome {
-    pub plugins: Vec<LoadedPlugin>,
+    plugins: Vec<LoadedPlugin>,
+    capability_summaries: Vec<PluginCapabilitySummary>,
+}
+
+impl Default for PluginLoadOutcome {
+    fn default() -> Self {
+        Self::from_plugins(Vec::new())
+    }
 }
 
 impl PluginLoadOutcome {
+    fn from_plugins(plugins: Vec<LoadedPlugin>) -> Self {
+        let capability_summaries = plugins
+            .iter()
+            .filter_map(PluginCapabilitySummary::from_plugin)
+            .collect::<Vec<_>>();
+        Self {
+            plugins,
+            capability_summaries,
+        }
+    }
+
     pub fn effective_skill_roots(&self) -> Vec<PathBuf> {
         let mut skill_roots: Vec<PathBuf> = self
             .plugins
@@ -79,6 +146,29 @@ impl PluginLoadOutcome {
             }
         }
         mcp_servers
+    }
+
+    pub fn effective_apps(&self) -> Vec<AppConnectorId> {
+        let mut apps = Vec::new();
+        let mut seen_connector_ids = std::collections::HashSet::new();
+
+        for plugin in self.plugins.iter().filter(|plugin| plugin.is_active()) {
+            for connector_id in &plugin.apps {
+                if seen_connector_ids.insert(connector_id.clone()) {
+                    apps.push(connector_id.clone());
+                }
+            }
+        }
+
+        apps
+    }
+
+    pub fn capability_summaries(&self) -> &[PluginCapabilitySummary] {
+        &self.capability_summaries
+    }
+
+    pub fn plugins(&self) -> &[LoadedPlugin] {
+        &self.plugins
     }
 }
 
@@ -108,11 +198,6 @@ impl PluginsManager {
         force_reload: bool,
     ) -> PluginLoadOutcome {
         if !plugins_feature_enabled_from_stack(config_layer_stack) {
-            let mut cache = match self.cache_by_cwd.write() {
-                Ok(cache) => cache,
-                Err(err) => err.into_inner(),
-            };
-            cache.insert(cwd.to_path_buf(), PluginLoadOutcome::default());
             return PluginLoadOutcome::default();
         }
 
@@ -149,10 +234,17 @@ impl PluginsManager {
         &self,
         request: PluginInstallRequest,
     ) -> Result<PluginInstallResult, PluginInstallError> {
+        let resolved = resolve_marketplace_plugin(
+            &request.cwd,
+            &request.plugin_name,
+            &request.marketplace_name,
+        )?;
         let store = self.store.clone();
-        let result = tokio::task::spawn_blocking(move || store.install(request))
-            .await
-            .map_err(PluginInstallError::join)??;
+        let result = tokio::task::spawn_blocking(move || {
+            store.install(resolved.source_path.into_path_buf(), resolved.plugin_id)
+        })
+        .await
+        .map_err(PluginInstallError::join)??;
 
         ConfigService::new_with_defaults(self.codex_home.clone())
             .write_value(ConfigValueWriteParams {
@@ -175,6 +267,9 @@ impl PluginsManager {
 #[derive(Debug, thiserror::Error)]
 pub enum PluginInstallError {
     #[error("{0}")]
+    Marketplace(#[from] MarketplaceError),
+
+    #[error("{0}")]
     Store(#[from] PluginStoreError),
 
     #[error("{0}")]
@@ -187,6 +282,18 @@ pub enum PluginInstallError {
 impl PluginInstallError {
     fn join(source: tokio::task::JoinError) -> Self {
         Self::Join(source)
+    }
+
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Marketplace(
+                MarketplaceError::InvalidMarketplaceFile { .. }
+                    | MarketplaceError::PluginNotFound { .. }
+                    | MarketplaceError::DuplicatePlugin { .. }
+                    | MarketplaceError::InvalidPlugin(_)
+            ) | Self::Store(PluginStoreError::Invalid(_))
+        )
     }
 }
 
@@ -227,6 +334,18 @@ struct PluginMcpFile {
     mcp_servers: HashMap<String, JsonValue>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginAppFile {
+    #[serde(default)]
+    apps: HashMap<String, PluginAppConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PluginAppConfig {
+    id: String,
+}
+
 pub(crate) fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     store: &PluginStore,
@@ -255,7 +374,7 @@ pub(crate) fn load_plugins_from_layer_stack(
         plugins.push(loaded_plugin);
     }
 
-    PluginLoadOutcome { plugins }
+    PluginLoadOutcome::from_plugins(plugins)
 }
 
 pub(crate) fn plugin_namespace_for_skill_path(path: &Path) -> Option<String> {
@@ -299,6 +418,7 @@ fn load_plugin(config_name: String, plugin: &PluginConfig, store: &PluginStore) 
         enabled: plugin.enabled,
         skill_roots: Vec::new(),
         mcp_servers: HashMap::new(),
+        apps: Vec::new(),
         error: None,
     };
 
@@ -341,6 +461,10 @@ fn load_plugin(config_name: String, plugin: &PluginConfig, store: &PluginStore) 
         }
     }
     loaded_plugin.mcp_servers = mcp_servers;
+    loaded_plugin.apps = load_apps_from_file(
+        plugin_root.as_path(),
+        &plugin_root.as_path().join(DEFAULT_APP_CONFIG_FILE),
+    );
     loaded_plugin
 }
 
@@ -362,6 +486,42 @@ fn default_mcp_config_paths(plugin_root: &Path) -> Vec<PathBuf> {
     paths.sort_unstable();
     paths.dedup();
     paths
+}
+
+fn load_apps_from_file(plugin_root: &Path, app_config_path: &Path) -> Vec<AppConnectorId> {
+    let Ok(contents) = fs::read_to_string(app_config_path) else {
+        return Vec::new();
+    };
+    let parsed = match serde_json::from_str::<PluginAppFile>(&contents) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(
+                path = %app_config_path.display(),
+                "failed to parse plugin app config: {err}"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut apps: Vec<PluginAppConfig> = parsed.apps.into_values().collect();
+    apps.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+    let mut connector_ids: Vec<AppConnectorId> = apps
+        .into_iter()
+        .filter_map(|app| {
+            if app.id.trim().is_empty() {
+                warn!(
+                    plugin = %plugin_root.display(),
+                    "plugin app config is missing an app id"
+                );
+                None
+            } else {
+                Some(AppConnectorId(app.id))
+            }
+        })
+        .collect();
+    connector_ids.dedup();
+    connector_ids
 }
 
 fn load_mcp_servers_from_file(plugin_root: &Path, mcp_config_path: &Path) -> PluginMcpDiscovery {
@@ -550,6 +710,16 @@ mod tests {
   }
 }"#,
         );
+        write_file(
+            &plugin_root.join(".app.json"),
+            r#"{
+  "apps": {
+    "example": {
+      "id": "connector_example"
+    }
+  }
+}"#,
+        );
 
         let outcome =
             load_plugins_from_config(&plugin_config_toml(true, true), codex_home.path()).await;
@@ -582,6 +752,7 @@ mod tests {
                         oauth_resource: None,
                     },
                 )]),
+                apps: vec![AppConnectorId("connector_example".to_string())],
                 error: None,
             }]
         );
@@ -590,6 +761,10 @@ mod tests {
             vec![plugin_root.join("skills")]
         );
         assert_eq!(outcome.effective_mcp_servers().len(), 1);
+        assert_eq!(
+            outcome.effective_apps(),
+            vec![AppConnectorId("connector_example".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -628,11 +803,175 @@ mod tests {
                 enabled: false,
                 skill_roots: Vec::new(),
                 mcp_servers: HashMap::new(),
+                apps: Vec::new(),
                 error: None,
             }]
         );
         assert!(outcome.effective_skill_roots().is_empty());
         assert!(outcome.effective_mcp_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn effective_apps_dedupes_connector_ids_across_plugins() {
+        let codex_home = TempDir::new().unwrap();
+        let plugin_a_root = codex_home
+            .path()
+            .join("plugins/cache")
+            .join("test/plugin-a/local");
+        let plugin_b_root = codex_home
+            .path()
+            .join("plugins/cache")
+            .join("test/plugin-b/local");
+
+        write_file(
+            &plugin_a_root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"plugin-a"}"#,
+        );
+        write_file(
+            &plugin_a_root.join(".app.json"),
+            r#"{
+  "apps": {
+    "example": {
+      "id": "connector_example"
+    }
+  }
+}"#,
+        );
+        write_file(
+            &plugin_b_root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"plugin-b"}"#,
+        );
+        write_file(
+            &plugin_b_root.join(".app.json"),
+            r#"{
+  "apps": {
+    "chat": {
+      "id": "connector_example"
+    },
+    "gmail": {
+      "id": "connector_gmail"
+    }
+  }
+}"#,
+        );
+
+        let mut root = toml::map::Map::new();
+        let mut features = toml::map::Map::new();
+        features.insert("plugins".to_string(), Value::Boolean(true));
+        root.insert("features".to_string(), Value::Table(features));
+
+        let mut plugins = toml::map::Map::new();
+
+        let mut plugin_a = toml::map::Map::new();
+        plugin_a.insert("enabled".to_string(), Value::Boolean(true));
+        plugins.insert("plugin-a@test".to_string(), Value::Table(plugin_a));
+
+        let mut plugin_b = toml::map::Map::new();
+        plugin_b.insert("enabled".to_string(), Value::Boolean(true));
+        plugins.insert("plugin-b@test".to_string(), Value::Table(plugin_b));
+
+        root.insert("plugins".to_string(), Value::Table(plugins));
+        let config_toml =
+            toml::to_string(&Value::Table(root)).expect("plugin test config should serialize");
+
+        let outcome = load_plugins_from_config(&config_toml, codex_home.path()).await;
+
+        assert_eq!(
+            outcome.effective_apps(),
+            vec![
+                AppConnectorId("connector_example".to_string()),
+                AppConnectorId("connector_gmail".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_index_filters_inactive_and_zero_capability_plugins() {
+        let codex_home = TempDir::new().unwrap();
+        let connector = |id: &str| AppConnectorId(id.to_string());
+        let http_server = |url: &str| McpServerConfig {
+            transport: McpServerTransportConfig::StreamableHttp {
+                url: url.to_string(),
+                bearer_token_env_var: None,
+                http_headers: None,
+                env_http_headers: None,
+            },
+            enabled: true,
+            required: false,
+            disabled_reason: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth_resource: None,
+        };
+        let plugin = |config_name: &str, dir_name: &str, manifest_name: &str| LoadedPlugin {
+            config_name: config_name.to_string(),
+            manifest_name: Some(manifest_name.to_string()),
+            root: AbsolutePathBuf::try_from(codex_home.path().join(dir_name)).unwrap(),
+            enabled: true,
+            skill_roots: Vec::new(),
+            mcp_servers: HashMap::new(),
+            apps: Vec::new(),
+            error: None,
+        };
+        let summary = |config_name: &str, display_name: &str| PluginCapabilitySummary {
+            config_name: config_name.to_string(),
+            display_name: display_name.to_string(),
+            ..PluginCapabilitySummary::default()
+        };
+        let outcome = PluginLoadOutcome::from_plugins(vec![
+            LoadedPlugin {
+                skill_roots: vec![codex_home.path().join("skills-plugin/skills")],
+                ..plugin("skills@test", "skills-plugin", "skills-plugin")
+            },
+            LoadedPlugin {
+                mcp_servers: HashMap::from([("alpha".to_string(), http_server("https://alpha"))]),
+                apps: vec![connector("connector_example")],
+                ..plugin("alpha@test", "alpha-plugin", "alpha-plugin")
+            },
+            LoadedPlugin {
+                mcp_servers: HashMap::from([("beta".to_string(), http_server("https://beta"))]),
+                apps: vec![connector("connector_example"), connector("connector_gmail")],
+                ..plugin("beta@test", "beta-plugin", "beta-plugin")
+            },
+            plugin("empty@test", "empty-plugin", "empty-plugin"),
+            LoadedPlugin {
+                enabled: false,
+                skill_roots: vec![codex_home.path().join("disabled-plugin/skills")],
+                apps: vec![connector("connector_hidden")],
+                ..plugin("disabled@test", "disabled-plugin", "disabled-plugin")
+            },
+            LoadedPlugin {
+                apps: vec![connector("connector_broken")],
+                error: Some("failed to load".to_string()),
+                ..plugin("broken@test", "broken-plugin", "broken-plugin")
+            },
+        ]);
+
+        assert_eq!(
+            outcome.capability_summaries(),
+            &[
+                PluginCapabilitySummary {
+                    has_skills: true,
+                    ..summary("skills@test", "skills-plugin")
+                },
+                PluginCapabilitySummary {
+                    mcp_server_names: vec!["alpha".to_string()],
+                    app_connector_ids: vec![connector("connector_example")],
+                    ..summary("alpha@test", "alpha-plugin")
+                },
+                PluginCapabilitySummary {
+                    mcp_server_names: vec!["beta".to_string()],
+                    app_connector_ids: vec![
+                        connector("connector_example"),
+                        connector("connector_gmail"),
+                    ],
+                    ..summary("beta@test", "beta-plugin")
+                },
+            ]
+        );
     }
 
     #[test]
@@ -719,12 +1058,36 @@ mod tests {
     #[tokio::test]
     async fn install_plugin_updates_config_with_relative_path_and_plugin_key() {
         let tmp = tempfile::tempdir().unwrap();
-        write_plugin(tmp.path(), "sample-plugin", "sample-plugin");
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+        write_plugin(
+            &repo_root.join(".agents/plugins"),
+            "sample-plugin",
+            "sample-plugin",
+        );
+        fs::write(
+            repo_root.join(".agents/plugins/marketplace.json"),
+            r#"{
+  "name": "debug",
+  "plugins": [
+    {
+      "name": "sample-plugin",
+      "source": {
+        "source": "local",
+        "path": "./sample-plugin"
+      }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
 
         let result = PluginsManager::new(tmp.path().to_path_buf())
             .install_plugin(PluginInstallRequest {
-                source_path: tmp.path().join("sample-plugin"),
-                marketplace_name: None,
+                plugin_name: "sample-plugin".to_string(),
+                marketplace_name: "debug".to_string(),
+                cwd: repo_root.clone(),
             })
             .await
             .unwrap();
