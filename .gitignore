@@ -90,4 +90,5 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-
+# Managed by evolution bootstrap: local Git worktrees
+.worktrees/
