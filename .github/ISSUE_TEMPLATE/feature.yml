@@ -1,0 +1,43 @@
+# 受管文件：由 evolution/scripts/bootstrap_governed_repo.py 生成。请在 evolution/templates/governed-repo 下修改模板。
+name: 功能需求
+description: 为受管仓库提交新的功能或改进需求
+title: "[功能] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本仓库遵循 ProjectHome 全局开发规则：
+        - Issue 优先
+        - Issue 用中文
+        - 小步快跑，小 PR
+        - 正式开发默认使用 worktree
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标
+      description: 用中文描述这次要解决的问题或要达成的结果。
+      placeholder: 例如：为知识库增加提案搜索能力，便于审核时快速定位历史建议。
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围
+      description: 说明本次要改哪些部分，不改哪些部分。
+      placeholder: 例如：只改 web 页面筛选与索引层；不改提案执行流程。
+    validations:
+      required: true
+  - type: textarea
+    id: breakdown
+    attributes:
+      label: 拆分建议
+      description: 如果任务较大，请先拆成父子 Issue 或多个可并行的小任务。
+      placeholder: 例如：先做索引，再做 UI，再做排序。
+  - type: textarea
+    id: worktree
+    attributes:
+      label: Worktree 计划
+      description: 说明是否需要独立 worktree，以及计划使用的分支或目录名。
+      placeholder: 例如：使用 feature/proposal-search，对应独立 worktree。

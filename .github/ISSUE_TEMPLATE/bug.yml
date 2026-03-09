@@ -1,0 +1,44 @@
+# 受管文件：由 evolution/scripts/bootstrap_governed_repo.py 生成。请在 evolution/templates/governed-repo 下修改模板。
+name: 缺陷修复
+description: 报告受管仓库中的问题或回归
+title: "[缺陷] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量用中文描述问题，并说明影响范围。
+        正式修复默认应使用独立 worktree，避免多个任务共享同一工作目录。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 这个问题具体表现是什么？
+      placeholder: 例如：审核页面切换状态筛选后，列表不会刷新。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 按顺序列出复现步骤。
+      placeholder: |
+        1. 打开页面
+        2. 切换到“待执行队列”
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响范围
+      description: 哪些用户、流程或仓库受到影响？
+      placeholder: 例如：只影响 evolution 审核页面，不影响提案文件本身。
+    validations:
+      required: true
+  - type: textarea
+    id: fix-split
+    attributes:
+      label: 修复拆分建议
+      description: 如果问题较复杂，说明是否需要拆成多个小修复。
